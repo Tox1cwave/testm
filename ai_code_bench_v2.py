@@ -339,7 +339,7 @@ PROMPT_TEMPLATE = r"""# 任务：修复并优化 core_utils.py（高难度）
 3. 限价单的 `price` 不是 `str`，或不能完整匹配 `[0-9]+(\.[0-9]{1,8})?`（只允许 ASCII 数字，不允许符号、空白、指数），或数值等于 0 → `"bad_price"`；
 4. `id` 与之前任何一条**通过校验**的 limit / market 指令的 `id` 相同（不论那张单现在是否还在簿上）→ `"duplicate_id"`。被拒绝的指令不占用 `id`。
 
-**价格**：价格是精确的十进制数（最多 8 位小数），按数值比较——`"10"`、`"10.0"`、`"010.00"` 是同一个价格。所有输出中的价格都用**规范形式**：去掉整数部分多余的前导零和小数部分末尾的零，小数部分为空时去掉小数点，例如 `"010.50"` → `"10.5"`、`"7.000"` → `"7"`、`"0.10"` → `"0.1"`。
+**价格**：价格是精确的十进制数（最多 8 位小数，整数部分位数不限），按数值比较——`"10"`、`"10.0"`、`"010.00"` 是同一个价格。所有输出中的价格都用**规范形式**：去掉整数部分多余的前导零和小数部分末尾的零，小数部分为空时去掉小数点，例如 `"010.50"` → `"10.5"`、`"7.000"` → `"7"`、`"0.10"` → `"0.1"`。
 
 **撮合**（对通过校验的 limit / market 单）：
 
@@ -627,17 +627,45 @@ _BOOK_SCALE = 10 ** 8
 _BOOK_PRICE_RE = re.compile(r"[0-9]+(?:\.[0-9]{1,8})?")
 
 
+_DIGIT_CHUNK = 4000  # Python 3.11+ 默认限制 int 与十进制字符串互转不超过 4300 位；分块转换，不改全局设置
+
+
+def _int_from_digits(digits):
+    if len(digits) <= _DIGIT_CHUNK:
+        return int(digits)
+    v = 0
+    for i in range(0, len(digits), _DIGIT_CHUNK):
+        part = digits[i:i + _DIGIT_CHUNK]
+        v = v * 10 ** len(part) + int(part)
+    return v
+
+
+_DIGIT_BASE = 10 ** _DIGIT_CHUNK
+
+
+def _digits_of(v):
+    if v < _DIGIT_BASE:
+        return str(v)
+    base = _DIGIT_BASE
+    parts = []
+    while v >= base:
+        v, r = divmod(v, base)
+        parts.append("%0*d" % (_DIGIT_CHUNK, r))
+    parts.append(str(v))
+    return "".join(reversed(parts))
+
+
 def _book_price(s):
     if type(s) is not str or _BOOK_PRICE_RE.fullmatch(s) is None:
         return None
     whole, _, frac = s.partition(".")
-    v = int(whole) * _BOOK_SCALE + (int(frac.ljust(8, "0")) if frac else 0)
+    v = _int_from_digits(whole) * _BOOK_SCALE + (int(frac.ljust(8, "0")) if frac else 0)
     return v if v > 0 else None
 
 
 def _book_fmt(v):
     whole, frac = divmod(v, _BOOK_SCALE)
-    return str(whole) if not frac else "%d.%s" % (whole, ("%08d" % frac).rstrip("0"))
+    return _digits_of(whole) if not frac else "%s.%s" % (_digits_of(whole), ("%08d" % frac).rstrip("0"))
 
 
 class _BookOrder(object):
@@ -2005,6 +2033,10 @@ def _tests_t3():
             ("随机高精度", lambda: ([_L("p%d" % i, "u%d" % (i % 3), ("buy", "sell")[i % 2],
                                      "99999999.9999999%d" % (i % 10), 1 + i % 4, "GTC") for i in range(40)],), REF),
         ])),
+        Test("隐性", "超长价格：整数部分 5000 位（超过 Python 3.11+ 默认的 int 与字符串互转位数上限）", _cases(F, [
+            ("5000 位", lambda: ([_L("s1", "A", VS, "9" * 5000 + ".5", 2), _L("s2", "B", VS, "9" * 4999 + "8", 1),
+                                 _L("b1", "C", VB, "1" + "0" * 5000, 2), _L("b2", "C", VB, "0" * 4400 + "7.10", 1)],), REF),
+        ])),
         Test("隐性", "只允许 ASCII 数字；bool 不是 int", _cases(F, [
             _book("非 ASCII", [_L("u1", "A", VB, "١٢", 1), _L("u2", "A", VB, "１２", 1),
                              _L("u3", "A", VB, "12", True), _A("u3", 1)],
@@ -2861,6 +2893,9 @@ def static_review(src):
                     notes.append("第 %s 行：调用了 %s" % (line, full))
                 if full == "sys.setrecursionlimit":
                     notes.append("第 %s 行：调高了递归上限（深递归仍可能导致 C 栈溢出崩溃）" % line)
+                if full == "sys.set_int_max_str_digits":
+                    notes.append("第 %s 行：修改了整个进程的 int 字符串转换位数上限（这是 CPython 针对 CVE-2020-10735 "
+                                 "的拒绝服务防护，改成 0 会对调用方的所有代码关闭该防护）" % line)
         elif isinstance(node, ast.Global):
             notes.append("第 %s 行：使用了 global 变量 %s（注意跨调用状态）" % (line, ", ".join(node.names)))
         elif isinstance(node, (ast.Import, ast.ImportFrom)):
@@ -3237,6 +3272,9 @@ def _crosscheck(rounds=400):
         cmp("T1(中等)", _ref_edit_distance, _naive_edit_distance, (a, b))
     cmp("T1(中等)", _ref_edit_distance, _naive_edit_distance, _perf_t1(5, 0.4).make())
     cmp("T3(中等)", _ref_run_book, _naive_run_book, (_t3_stream(5, 2500),))
+    cmp("T3(超长价格)", _ref_run_book, _naive_run_book, ([_L("h%d" % i, "u%d" % (i % 3), ("buy", "sell")[i % 2],
+                                                          str(7 + i % 4) * (4300 + 37 * i) + ".%d" % (i % 10), 1 + i % 3)
+                                                       for i in range(24)],))
     cmp("T3(中等, 撤单多)", _ref_run_book, _naive_run_book, (_t3_stream(6, 2500, cancel_ratio=0.5, fok_ratio=0.2),))
     cmp("T4(中等)", _RefTTLCache, _NaiveTTLCache, _perf_t4(5, 0.05).make(), call=_cache_call)
     case = _perf_t5(5, 0.1)
